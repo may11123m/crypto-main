@@ -1,0 +1,8 @@
+.env
+*.db
+crypto_alerts.db
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/

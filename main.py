@@ -1,0 +1,301 @@
+import asyncio
+import logging
+import os
+from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.types import Message
+from aiohttp import web
+
+from services.price_service import price_service
+from services.search_service import search_service
+from services.indicator_service import indicator_service
+from services.security_service import security_service
+from services.futures_service import futures_service
+from services.alert_service import alert_service
+
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# Web server health check for Render free tier
+async def handle_health_check(request):
+    return web.Response(text="Bot is online and running!")
+
+# Background Task to monitor price alerts
+async def check_alerts_loop():
+    while True:
+        try:
+            alerts = await alert_service.get_all_alerts()
+            for alert in alerts:
+                data = await price_service.get_crypto_price(alert['symbol'])
+                if "error" in data:
+                    continue
+
+                current_price = data['price']
+                triggered = False
+
+                if alert['condition'] == "ABOVE" and current_price >= alert['target_price']:
+                    triggered = True
+                elif alert['condition'] == "BELOW" and current_price <= alert['target_price']:
+                    triggered = True
+
+                if triggered:
+                    msg_text = (
+                        f"🚨 **PRICE ALERT TRIGGERED!** 🚨\n\n"
+                        f"💎 **Token:** `{alert['symbol']}`\n"
+                        f"🎯 **Target Price:** `${alert['target_price']:,.4f}`\n"
+                        f"💵 **Current Price:** `${current_price:,.4f}`\n"
+                        f"📊 **Condition:** Price went `{alert['condition']}` target!"
+                    )
+                    try:
+                        await bot.send_message(chat_id=alert['user_id'], text=msg_text, parse_mode="Markdown")
+                        await alert_service.remove_triggered_alert(alert['id'])
+                    except Exception as err:
+                        logger.error(f"Failed to send alert to {alert['user_id']}: {err}")
+
+        except Exception as e:
+            logger.error(f"Error in alert monitoring loop: {e}")
+
+        await asyncio.sleep(30)
+
+
+@dp.message(Command("start"))
+async def start_handler(message: Message):
+    welcome_text = (
+        "🌐 **CryptoPulse Pro v2**\n\n"
+        "• Send symbol (`BTC`, `ETH`) for **Spot Price Data**\n"
+        "• Type `ta btc` for **Technical Analysis (RSI, MACD)**\n"
+        "• Type `ft btc` for **Futures Data (Funding Rate, OI, L/S)**\n"
+        "• Type `alert btc 65000` to **Set Price Alert**\n"
+        "• Type `/myalerts` to **View Active Alerts**\n"
+        "• Type `check 0x...` for **Token Security Audit**"
+    )
+    await message.answer(welcome_text, parse_mode="Markdown")
+
+# Set Price Alert Handler
+@dp.message(F.text.lower().startswith("alert "))
+async def handle_set_alert(message: Message):
+    parts = message.text.strip().split()
+    if len(parts) < 3:
+        await message.answer("❌ **Usage:** `alert <symbol> <target_price>`\nExample: `alert btc 65000`", parse_mode="Markdown")
+        return
+
+    symbol = parts[1].upper()
+    try:
+        target_price = float(parts[2])
+    except ValueError:
+        await message.answer("❌ Invalid target price format. Use numbers like `65000` or `1.25`.")
+        return
+
+    data = await price_service.get_crypto_price(symbol)
+    if "error" in data:
+        await message.answer(f"❌ Symbol **'{symbol}'** not found on CEX exchanges.")
+        return
+
+    current_price = data['price']
+    condition = "ABOVE" if target_price > current_price else "BELOW"
+
+    alert_id = await alert_service.add_alert(
+        user_id=message.from_user.id,
+        symbol=symbol,
+        target_price=target_price,
+        condition=condition
+    )
+
+    cond_emoji = "📈" if condition == "ABOVE" else "📉"
+    response = (
+        f"✅ **Price Alert Set Successfully!** [ID: `{alert_id}`]\n\n"
+        f"🪙 **Token:** `{symbol}`\n"
+        f"💵 **Current Price:** `${current_price:,.4f}`\n"
+        f"🎯 **Target Price:** `${target_price:,.4f}`\n"
+        f"{cond_emoji} **Trigger:** When price goes `{condition}` target."
+    )
+    await message.answer(response, parse_mode="Markdown")
+
+# View Active Alerts
+@dp.message(Command("myalerts"))
+async def handle_my_alerts(message: Message):
+    user_alerts = await alert_service.get_user_alerts(message.from_user.id)
+
+    if not user_alerts:
+        await message.answer("ℹ️ You have no active price alerts set.")
+        return
+
+    text = "📋 **Your Active Price Alerts:**\n\n"
+    for a in user_alerts:
+        cond_icon = "📈" if a['condition'] == "ABOVE" else "📉"
+        text += f"• **ID `{a['id']}`** | `{a['symbol']}` {cond_icon} `${a['target_price']:,.4f}` ({a['condition']})\n"
+
+    text += "\n💡 *To delete an alert, send:* `/delalert <ID>`"
+    await message.answer(text, parse_mode="Markdown")
+
+# Delete Alert Handler
+@dp.message(Command("delalert"))
+async def handle_del_alert(message: Message):
+    parts = message.text.strip().split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("❌ **Usage:** `/delalert <alert_id>`", parse_mode="Markdown")
+        return
+
+    alert_id = int(parts[1])
+    success = await alert_service.delete_alert(alert_id, message.from_user.id)
+
+    if success:
+        await message.answer(f"🗑️ Alert ID `{alert_id}` removed successfully.", parse_mode="Markdown")
+    else:
+        await message.answer(f"❌ Alert ID `{alert_id}` not found or does not belong to you.", parse_mode="Markdown")
+
+# Futures Data Handler
+@dp.message(F.text.lower().startswith("ft "))
+async def handle_futures(message: Message):
+    symbol = message.text.lower().replace("ft ", "").strip()
+    msg = await message.answer(f"📈 Fetching Futures metrics for **{symbol.upper()}**...")
+
+    ft_data = await futures_service.get_futures_data(symbol)
+
+    if "error" in ft_data:
+        await msg.edit_text(f"❌ {ft_data['error']}")
+        return
+
+    funding_emoji = "🔴" if ft_data['funding_rate'] > 0.03 else ("🟢" if ft_data['funding_rate'] < 0 else "⚪")
+
+    response = (
+        f"📊 **Futures Data: {ft_data['symbol']}**\n\n"
+        f"💵 **Mark Price:** `${ft_data['mark_price']:,.2f}`\n\n"
+        f"{funding_emoji} **Funding Rate (8h):** `{ft_data['funding_rate']:+.4f}%`\n"
+        f"📌 **Market Condition:** `{ft_data['funding_signal']}`\n\n"
+        f"💧 **Open Interest (USD):** `${ft_data['open_interest_usd']:,.0f}`\n"
+        f"⚖️ **Long / Short Ratio:** `{ft_data['long_short_ratio']:.2f}`\n"
+        f"• **Long Accounts:** `{ft_data['long_pct']:.1f}%` 🟢\n"
+        f"• **Short Accounts:** `{ft_data['short_pct']:.1f}%` 🔴\n\n"
+        f"⚠️ *Not financial advice*"
+    )
+    await msg.edit_text(response, parse_mode="Markdown")
+
+# Security Audit Handler
+@dp.message(F.text.lower().startswith("check "))
+async def handle_security_check(message: Message):
+    address = message.text.lower().replace("check ", "").strip()
+    msg = await message.answer(f"🛡️ Auditing contract address **`{address[:10]}...`** for risks...")
+
+    audit = await security_service.check_token_security(address, chain_id="1")
+
+    if "error" in audit:
+        await msg.edit_text(f"❌ {audit['error']}")
+        return
+
+    flags_text = "\n".join(audit['risk_flags']) if audit['risk_flags'] else "None detected ✅"
+
+    response = (
+        f"🛡️ **Security Report: {audit['token_name']} ({audit['token_symbol']})**\n\n"
+        f"🚦 **Risk Assessment:** `{audit['risk_level']}`\n"
+        f"🍯 **Honeypot Test:** `{audit['is_honeypot']}`\n\n"
+        f"📊 **Contract Metrics:**\n"
+        f"• Buy Tax: `{audit['buy_tax']}` | Sell Tax: `{audit['sell_tax']}`\n"
+        f"• Source Code: `{audit['is_open_source']}`\n"
+        f"• Mintable: `{audit['is_mintable']}`\n"
+        f"• Contract Owner: `{audit['owner'][:12]}...`\n\n"
+        f"⚠️ **Detected Risk Warnings:**\n{flags_text}\n\n"
+        f"⚠️ *Not financial advice*"
+    )
+    await msg.edit_text(response, parse_mode="Markdown")
+
+# Technical Analysis Handler
+@dp.message(F.text.lower().startswith("ta "))
+async def handle_ta(message: Message):
+    symbol = message.text.lower().replace("ta ", "").strip()
+    msg = await message.answer(f"⚙️ Calculating technical signals for **{symbol.upper()}**...")
+
+    analysis = await indicator_service.analyze_symbol(symbol, interval="1h")
+
+    if "error" in analysis:
+        await msg.edit_text(f"❌ {analysis['error']}")
+        return
+
+    response = (
+        f"⚡ **Technical Signal: {analysis['symbol']} (1H)**\n\n"
+        f"📊 **Market Sentiment:** `{analysis['sentiment']}`\n"
+        f"🎯 **Technical Score:** `{analysis['score']} / 10`\n\n"
+        f"🔹 **RSI (14):** `{analysis['rsi']}` ➔ {analysis['rsi_status']}\n"
+        f"🔹 **MACD Signal:** {analysis['macd_status']}\n"
+        f"🔹 **EMA 200 Trend:** {analysis['trend_status']}\n\n"
+        f"⚠️ *Not financial advice*"
+    )
+    await msg.edit_text(response, parse_mode="Markdown")
+
+# Default Search / Price Handler
+@dp.message(F.text)
+async def handle_search(message: Message):
+    query = message.text.strip()
+    if query.startswith("/"):
+        return
+
+    msg = await message.answer(f"🔍 Fetching price data for **'{query}'**...")
+
+    cex_data = await price_service.get_crypto_price(query)
+    if "error" not in cex_data:
+        change_emoji = "🟢" if cex_data['change_24h'] >= 0 else "🔴"
+        response = (
+            f"📊 **{cex_data['symbol']} Price Overview**\n\n"
+            f"💵 **Price:** `${cex_data['price']:,.4f}`\n"
+            f"{change_emoji} **24h Change:** `{cex_data['change_24h']:+.2f}%`\n"
+            f"📈 **24h High:** `${cex_data['high_24h']:,.4f}`\n"
+            f"📉 **24h Low:** `${cex_data['low_24h']:,.4f}`\n"
+            f"💰 **24h Volume:** `${cex_data['volume']:,.2f}`\n\n"
+            f"💡 *Tip: Try 'alert {cex_data['symbol']} 65000' or 'ta {cex_data['symbol']}'*\n"
+            f"⚠️ *Not financial advice*"
+        )
+        await msg.edit_text(response, parse_mode="Markdown")
+        return
+
+    dex_results = await search_service.search_token(query)
+    if not dex_results:
+        await msg.edit_text(f"❌ No matching token found for **'{query}'**.")
+        return
+
+    first = dex_results[0]
+    change_emoji = "🟢" if first['change_24h'] >= 0 else "🔴"
+    response = (
+        f"🌐 **{first['name']} ({first['symbol']})**\n"
+        f"🔗 **Chain:** `{first['chain']}` | **DEX:** `{first['dex']}`\n\n"
+        f"💵 **Price:** `${first['price_usd']:,.6f}`\n"
+        f"{change_emoji} **24h Change:** `{first['change_24h']:+.2f}%`\n"
+        f"💧 **Liquidity:** `${first['liquidity']:,.2f}`\n"
+        f"📝 **Contract:**\n`{first['contract']}`\n\n"
+        f"⚠️ *Not financial advice*"
+    )
+    await msg.edit_text(response, parse_mode="Markdown")
+
+async def main():
+    if not BOT_TOKEN:
+        logger.error("❌ BOT_TOKEN missing in .env file!")
+        return
+
+    # Init SQLite DB & Start Alert Background Loop
+    await alert_service.init_db()
+    asyncio.create_task(check_alerts_loop())
+
+    # Start Aiohttp Web Server for Render Free Tier
+    app = web.Application()
+    app.router.add_get("/", handle_health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    logger.info(f"🌐 Health server started on port {port}")
+    logger.info("🚀 CryptoPulse Pro v2 Bot Running...")
+
+    # Start Telegram Long Polling
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
